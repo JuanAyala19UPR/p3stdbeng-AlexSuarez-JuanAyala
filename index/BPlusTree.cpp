@@ -1613,13 +1613,130 @@ bool BPlusTree::verify_rec(std::uint32_t block, std::uint32_t depth,
     // minimum upward. At a leaf: order, every rid judged through
     // occupied (dangling findings), walked += count, depth range
     // updated, and the subtree minimum reported (nullopt when empty).
+
+    if (block>=walk.seen.size()) {
+        walk.findings.push_back("block " + std::to_string(block) +"is beyond the file");
+        return true;
+    }
+    if (walk.seen[block]==1) {
+        walk.findings.push_back("block "+std::to_string(block)+" is reachable twice");
+        return true;
+    }
+
+    walk.seen[block]=1;
+
+    // Case for separators
+    if (depth<levels_) {
+
+        std::size_t frame=0;
+        BptSeparatorPage separator;
+        if (!pin_separator(block, separator, frame, error)) {
+            return false;
+        }
+        //Regla de ocupacion
+        if (!is_root && (separator.count()<min_separator_keys() ||
+                         separator.count()>max_separator_keys() ) ) {
+            walk.findings.push_back("block"+std::to_string(block)+"has a bad key count");
+        }
+
+        depth+=1;
+
+        auto first_child=separator.first_child();
+        std::optional<std::string> subtree_min_first;
+        if (!verify_rec(
+            first_child,depth,false, walk,error, &subtree_min_first)) {
+            release(manager_, frame, false);
+            return false;
+        }
+        if (subtree_min!=nullptr) {
+            *subtree_min=subtree_min_first;
+        }
+
+        for (std::size_t i=0;i<separator.count();i++) {
+            if (i>0) {
+                if (codec_.compare(separator.separator_key(i-1),separator.separator_key(i))>0){
+                    walk.findings.push_back("separators of block"+std::to_string(block)+"are out of order at position"+std::to_string(i));
+                }
+            }
+
+            std::uint32_t block_child=separator.child(i);
+            std::optional<std::string> subtree_min_local;
+            if (!verify_rec(block_child,depth, false,walk,error,&subtree_min_local)) {
+                release(manager_,frame,false);
+                return false;
+            }
+
+
+            if (!subtree_min_local.has_value()) {
+                walk.findings.push_back("block"+std::to_string(block)+"subtree don't has a value");
+            }else
+            //if (subtree_min_local!=separator.separator_key(i)) {
+            if (codec_.compare(subtree_min_local->data(),separator.separator_key(i))!=0){
+                walk.findings.push_back("block"+std::to_string(block)+"subtree don't is equal to her parent");
+                }
+            }
+        release(manager_,frame, false);
+        }
+
+    // Case for leafs
+    else{
+        BptLeafPage leaf;
+        size_t frame=0;
+        if (!pin_leaf(block,leaf,frame,error)){
+            return false;
+        }
+
+        //Regla de ocupancy
+        if (!is_root && (leaf.count()<min_leaf_entries() ||
+                       leaf.count()>max_leaf_entries() ) ) {
+            walk.findings.push_back("block"+std::to_string(block)+"has a bad entry count");
+                       }
+        if (subtree_min!=nullptr) {
+            if (leaf.count()==0) {
+                *subtree_min = std::nullopt;
+            }else if (subtree_min!=nullptr) {
+                *subtree_min=leaf.get_entry(0).key;
+            }
+        }
+
+
+        for (std::size_t i=0;i<leaf.count();i++) {
+            if (i>0) {
+                //if (codec_.compare(leaf.get_entry(i-1),leaf.separator_key(i))>0){
+                if (codec_.compare(leaf.get_entry(i-1).key.data(), leaf.get_entry(i).key.data()) > 0)  {
+                    walk.findings.push_back("leaves of block"+std::to_string(block)+"are out of order at position"+std::to_string(i));
+                }
+            }
+
+            if (!walk.occupied(leaf.get_entry(i).rid)){
+                walk.findings.push_back( "has a dangling rid at entry "+std::to_string(block));
+            }
+        }
+        if (walk.min_depth==0) {
+            walk.min_depth=depth;
+            walk.max_depth=depth;
+        }else {
+            if (depth<walk.min_depth) {
+                walk.min_depth=depth;
+            }
+            if (depth>walk.max_depth) {
+                walk.max_depth=depth;
+            }
+        }
+        walk.walked+=leaf.count();
+        release(manager_,frame, false);
+    }
+
+
+    /*
     (void)block;
     (void)depth;
     (void)is_root;
     (void)walk;
     (void)error;
     (void)subtree_min;
-    return false;
+    */
+    return true;
 }
 
 }
