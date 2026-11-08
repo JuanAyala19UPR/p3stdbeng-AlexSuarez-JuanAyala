@@ -609,11 +609,35 @@ std::uint32_t BPlusTree::tree_search(std::uint32_t block,
     // (routing_child_index), release the pin, and recurse into that
     // child with levels_remaining - 1. An empty tree (kNoPage) also
     // returns kNoPage.
+    if (block==idx::kNoPage) {
+        return idx::kNoPage;
+    }
+    if (levels_remaining==1) {
+        return block;
+    }else{
+        BptSeparatorPage separator;
+        std::size_t frame=0;
+        if (!pin_separator(block, separator, frame, error)) {
+            return idx::kNoPage;
+        }
+        std::uint32_t  block_child=0;
+        std::size_t position=separator.routing_child_index(key_bytes.data(),codec_);
+        if (position==0) {
+            block_child=separator.first_child();
+        }else {
+            block_child=separator.child(position-1);
+        }
+        release(manager_, frame, false);
+        return tree_search(block_child,levels_remaining-1,key_bytes,error);
+
+    }
+    /*
     (void)block;
     (void)levels_remaining;
     (void)key_bytes;
     (void)error;
     return idx::kNoPage;
+    */
 }
 // BPlusTree::run_start — the equal-key run's leftmost leaf: walks left
 // from the landing leaf while the previous leaf's LAST key EQUALS the
