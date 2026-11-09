@@ -629,21 +629,65 @@ std::uint32_t BPlusTree::tree_search(std::uint32_t block,
 //
 // Returns: the run's first leaf's block id (the landing itself when no
 // left neighbour's tail equals the target); kNoPage on a pin failure.
-std::uint32_t BPlusTree::run_start(std::uint32_t landing,
-                                   const std::string& key_bytes,
-                                   std::string& error) {
-    // TODO(student): the equal-key run's leftmost leaf (design D4).
-    // Walk left from `landing` while the PREVIOUS leaf's LAST key equals
-    // the target (exact equality — a >= test over-walks): pin the
-    // current leaf, read its prev link, release; pin the previous leaf,
-    // compare its last entry's key with key_bytes, release; stop and
-    // return `current` when prev is kNoPage or the tail does not equal
-    // the target, else continue from prev.
-    (void)landing;
-    (void)key_bytes;
-    (void)error;
-    return idx::kNoPage;
-}
+    std::uint32_t BPlusTree::run_start(std::uint32_t landing,
+                                       const std::string& key_bytes,
+                                       std::string& error) {
+        // TODO(student): the equal-key run's leftmost leaf (design D4).
+        // Walk left from `landing` while the PREVIOUS leaf's LAST key equals
+        // the target (exact equality — a >= test over-walks): pin the
+        // current leaf, read its prev link, release; pin the previous leaf,
+        // compare its last entry's key with key_bytes, release; stop and
+        // return `current` when prev is kNoPage or the tail does not equal
+        // the target, else continue from prev.
+
+        //Este  metodo lo que hace es mirar si la key esta en el ultimo entrie de las anteriores leaf, debido a ello necesita un buclie
+        std::uint32_t block_response=landing;
+        bool correcto=true;
+
+        while (correcto) {
+
+            BptLeafPage leaf;
+            std::size_t frame;
+            if (!pin_leaf(block_response,leaf, frame, error)) {
+                return idx::kNoPage;
+            }
+
+            if (leaf.prev_leaf()==idx::kNoPage) {
+                release(manager_,frame, false);
+                return block_response;
+            }
+
+            std::uint32_t block_prev=leaf.prev_leaf();
+            BptLeafPage leaf_prev;
+            std::size_t frame_prev;
+
+            if (!pin_leaf(block_prev, leaf_prev, frame_prev, error)) {
+                release(manager_,frame, false);
+                return idx::kNoPage;
+
+            }
+            if (leaf_prev.count()==0) {
+                release(manager_,frame, false);
+                release(manager_,frame_prev, false);
+                return block_response;
+            }
+            std::string key_leaf_prev=leaf_prev.get_entry(leaf_prev.count()-1).key;
+            if (codec_.compare(key_leaf_prev.data(),key_bytes.data())==0) {
+                block_response=block_prev;
+            }else {
+                correcto=false;
+            }
+            release(manager_,frame_prev, false);
+            release(manager_,frame, false);
+        }
+
+
+        return block_response;
+        //(void)landing;
+        //(void)key_bytes;
+        //(void)error;
+        //return idx::kNoPage;
+    }
 // BPlusTree::gather_run — collects every entry whose key equals the
 // target, scanning leaves left to right from `start`: the run continues
 // while a leaf's last key still compares equal. Lookup's answer walk.
