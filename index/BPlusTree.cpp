@@ -4,6 +4,8 @@
 #include <cstring>
 #include <unordered_map>
 
+#include "IndexPages.h"
+
 namespace bptree {
 
 namespace {
@@ -1335,7 +1337,7 @@ void release_surgery(bufman::BufferManager& manager,
 // to stay exact. Surgery pins in ascending block order, first.
 //
 // Parameters:
-//   block: the parent's block id.
+//   block: the parent's block id.borrow_from_left
 //   child_index: the underflowed child's routing position (> 0 — a
 //     left borrow needs a left sibling).
 //   child_block: the child's block id.
@@ -1360,6 +1362,70 @@ bool BPlusTree::borrow_from_left(std::uint32_t block, std::size_t child_index,
     // key move through the parent (the child's new first child and first
     // key; the parent's separator becomes the moved key). Release
     // everything dirty; clear up.underflow.
+    (void)child_count;
+    //Creamos primero el vector donde se guardara el padre, el hijo y el hermano.
+    std::vector<std::uint32_t> blocks={block,child_block,left_block};
+    //Hacemos pin surgery pin surgery permite pinear varios blocks a la vez
+    std::unordered_map<std::uint32_t, std::size_t> frames;
+    if (!pin_surgery(manager_, file_, blocks,frames ,error )) {
+        return false;
+    }
+    BptSeparatorPage father;
+    father.bind(manager_.frame(frames[block]).buffer,codec_.width());
+
+    //No se usan
+    //std::uint32_t position_child=father.child(child_index);
+    //std:uint32_t position_left=father.child(child_index-1);
+    //const char* father_separator=father.separator_key(child_index-1);
+    //Conectar las vistas
+    if (child_is_leaf) {
+        //Page del child
+        BptLeafPage child;
+        //Bindear
+        child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+        //Page del hermano
+        BptLeafPage left;
+        left.bind(manager_.frame(frames[left_block]).buffer,codec_.width());
+        //Intercambio
+        idx::DataEntry entry_left=left.get_entry(left.count()-1);
+        if (!left.erase_entry(left.count()-1, error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        if (!child.insert_entry(entry_left,codec_,error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        father.set_separator_key(child_index-1,entry_left.key.c_str());
+        release_surgery(manager_, frames);
+        up.underflow=false;
+        return true;
+    }else {
+        BptSeparatorPage child;
+        child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+        BptSeparatorPage left;
+        left.bind(manager_.frame(frames[left_block]).buffer,codec_.width());
+        // Copiar la ultima key del hermano
+        const std::string last_key_child(left.separator_key(left.count() - 1), codec_.width());
+        //Copiar su ultimo hijo
+        idx::IndexEntry last_child=left.entry(left.count()-1);
+        std::string father_sep(father.separator_key(child_index - 1), codec_.width());        //El hijo actual del hijo
+        std::uint32_t first_child_now=child.first_child();
+        //En el hijo agregar el separador del padre junto con el antiguo primer hijo del hijo
+        if (!child.insert_pair_after(0,idx::IndexEntry{father_sep,first_child_now},error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        child.set_first_child(last_child.child);
+        left.erase_pair(left.count()-1,codec_.width());
+        father.set_separator_key(child_index-1,last_key_child.data());
+        release_surgery(manager_, frames);
+        up.underflow=false;
+        return true;
+    }
+
+
+    /*
     (void)block;
     (void)child_index;
     (void)child_block;
@@ -1369,6 +1435,7 @@ bool BPlusTree::borrow_from_left(std::uint32_t block, std::size_t child_index,
     (void)up;
     (void)error;
     return false;
+    */
 }
 // BPlusTree::borrow_from_right — redistribution from the right sibling
 // (slide 41): a leaf child gains the sibling's first entry at its end;
