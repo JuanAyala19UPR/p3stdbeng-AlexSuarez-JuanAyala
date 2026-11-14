@@ -725,12 +725,49 @@ bool BPlusTree::locate_in_run(const std::string& key_bytes, idx::Rid rid,
     // out-parameters. Continue into next_leaf while the last key equals
     // the target; a run that exhausts without the rid is a named error
     // ("no index entry for key ... and rid ...").
-    (void)key_bytes;
-    (void)rid;
-    (void)start;
-    (void)leaf_block;
-    (void)pos;
-    (void)error;
+    error.clear();
+
+    for (std::uint32_t current = start; current != idx::kNoPage;) {
+        BptLeafPage leaf;
+        std::size_t frame = 0;
+
+        if (!pin_leaf(current, leaf, frame, error)) {
+            return false;
+        }
+
+        const std::size_t count = leaf.count();
+        const std::size_t first = leaf.lower_bound(key_bytes.data(), codec_);
+
+        for (std::size_t i = first; i < count; ++i) {
+            const auto entry = leaf.get_entry(i);
+
+            if (codec_.compare(entry.key.data(), key_bytes.data()) != 0) {
+                break;
+            }
+
+            if (entry.rid == rid) {
+                leaf_block = current;
+                pos = i;
+                release(manager_, frame, false);
+                return true;
+            }
+        }
+
+        const bool continues =
+            count != 0 &&
+            codec_.compare(leaf.get_entry(count - 1).key.data(),
+                           key_bytes.data()) == 0;
+
+        const std::uint32_t next =
+            continues ? leaf.next_leaf() : idx::kNoPage;
+
+        release(manager_, frame, false);
+        current = next;
+    }
+
+    error = "no index entry for key " + codec_.display(key_bytes.data()) +
+            " and rid (" + std::to_string(rid.page_id) + ", " +
+            std::to_string(rid.slot) + ")";
     return false;
 }
 // BPlusTree::lookup — all entries whose key equals `key`: descend by
