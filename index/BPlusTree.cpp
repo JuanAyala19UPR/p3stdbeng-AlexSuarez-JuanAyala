@@ -663,11 +663,42 @@ bool BPlusTree::gather_run(const std::string& key_bytes, std::uint32_t start,
     // while keys compare equal, pushing each entry's rid into `out`;
     // the run continues into next_leaf while the leaf's LAST key equals
     // the target. Stop at the first leaf whose last key differs.
-    (void)key_bytes;
-    (void)start;
-    (void)out;
-    (void)error;
-    return false;
+     error.clear();
+
+    for (std::uint32_t current = start; current != idx::kNoPage;) {
+        BptLeafPage leaf;
+        std::size_t frame = 0;
+
+        if (!pin_leaf(current, leaf, frame, error)) {
+            return false;
+        }
+
+        const std::size_t count = leaf.count();
+        const std::size_t first = leaf.lower_bound(key_bytes.data(), codec_);
+
+        for (std::size_t i = first; i < count; ++i) {
+            const auto entry = leaf.get_entry(i);
+
+            if (codec_.compare(entry.key.data(), key_bytes.data()) != 0) {
+                break;
+            }
+
+            out.push_back(entry.rid);
+        }
+
+        const bool continues =
+            count != 0 &&
+            codec_.compare(leaf.get_entry(count - 1).key.data(),
+                           key_bytes.data()) == 0;
+
+        const std::uint32_t next =
+            continues ? leaf.next_leaf() : idx::kNoPage;
+
+        release(manager_, frame, false);
+        current = next;
+    }
+
+    return true;
 }
 // BPlusTree::locate_in_run — finds the exact (key, rid) entry within
 // the equal-key run: the leaves are scanned for the pair, so the erase
