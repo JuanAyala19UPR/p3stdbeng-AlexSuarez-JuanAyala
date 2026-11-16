@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <format>
 #include <unordered_map>
 
 #include "IndexPages.h"
@@ -1011,13 +1012,7 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
     // its child becomes the new page's first child
     // (move_tail_to(middle + 1)), filling `split` for the parent. The
     // wrapper turns a root split into a new root.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)rid;
-    (void)split;
-    (void)error;
-    return false;
+   
 }
 // BPlusTree::insert_leaf — the leaf phase of insert_aux: room within
 // 2d means a plain sorted insert; a full leaf (2d entries) splits per
@@ -1049,12 +1044,8 @@ bool BPlusTree::insert_leaf(std::uint32_t block, const std::string& key_bytes,
     // (equal keys go RIGHT — where the routing sends their duplicates).
     // Fill `split` with the copied-up separator (the new leaf's smallest
     // key) and the new block.
-    (void)block;
-    (void)key_bytes;
-    (void)rid;
-    (void)split;
-    (void)error;
-    return false;
+
+
 }
 
 // --- the recursion contract: erase ----------------------------------------------
@@ -1471,6 +1462,73 @@ bool BPlusTree::borrow_from_right(std::uint32_t block, std::size_t child_index,
     // rewrites (or propagates) its left boundary. Separator child:
     // rotate — the sibling's first child and first key move through the
     // parent. Release everything dirty; clear up.underflow.
+
+    //Creamos primero el vector donde se guardara el padre, el hijo y el hermano.
+    std::vector<std::uint32_t> blocks={block,child_block,right_block};
+    //Hacemos pin surgery pin surgery permite pinear varios blocks a la vez
+    std::unordered_map<std::uint32_t, std::size_t> frames;
+    if (!pin_surgery(manager_, file_, blocks,frames ,error )) {
+        return false;
+    }
+    BptSeparatorPage father;
+    father.bind(manager_.frame(frames[block]).buffer,codec_.width());
+    if (child_is_leaf) {
+        //Page del child
+        BptLeafPage child;
+        //Bindear
+        child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+        //Page del hermano
+        BptLeafPage right;
+        right.bind(manager_.frame(frames[right_block]).buffer,codec_.width());
+        //Intercambio
+        idx::DataEntry entry_right=right.get_entry(0);
+        if (!right.erase_entry(0, error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        if (!child.insert_entry(entry_right,codec_,error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        idx::DataEntry entry_new_right=right.get_entry(0);
+        father.set_separator_key(child_index,entry_new_right.key.data());
+        if (child_count==0) {
+            if (child_index==0) {
+                up.first_changed=true;
+                up.new_first=entry_right.key;
+            }else {
+                father.set_separator_key(child_index-1,entry_right.key.data());
+            }
+
+        }
+        release_surgery(manager_, frames);
+        up.underflow=false;
+        return true;
+    }else {
+        BptSeparatorPage child;
+        child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+        BptSeparatorPage right;
+        right.bind(manager_.frame(frames[right_block]).buffer,codec_.width());
+        // Copiar la ultima primera key del hermano
+        const std::string first_key_child(right.separator_key(0), codec_.width());
+        //Copiar su primer hijo
+        std::uint32_t first_child=right.first_child();
+        idx::IndexEntry last_child = right.entry(0);
+        std::string father_sep(father.separator_key(child_index), codec_.width());        //El hijo actual del hijo
+        //std::uint32_t first_child_now=child.first_child();
+        //En el hijo agregar el separador del padre junto con el antiguo primer hijo del hijo
+        if (!child.insert_pair_after(child.count(),idx::IndexEntry{father_sep,first_child},error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        right.set_first_child(last_child.child);
+        right.erase_pair(0,codec_.width());
+        father.set_separator_key(child_index,first_key_child.data());
+        release_surgery(manager_, frames);
+        up.underflow=false;
+        return true;
+
+    }
     (void)block;
     (void)child_index;
     (void)child_block;
