@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <format>
 #include <unordered_map>
 
 #include "IndexPages.h"
@@ -18,6 +19,7 @@ void release(bufman::BufferManager& manager, std::size_t frame,
              bool was_dirty) {
     std::string unpin_error;
     manager.unpin(frame, was_dirty, unpin_error);
+
 }
 
 constexpr std::uint32_t kBptMagic = 0x31545042u; // "BPT1"
@@ -1079,104 +1081,7 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
     // its child becomes the new page's first child
     // (move_tail_to(middle + 1)), filling `split` for the parent. The
     // wrapper turns a root split into a new root.
-    error.clear();
-    split = Split{};
 
-    if (levels_remaining <= 1) {
-        return insert_leaf(block, key_bytes, rid, split, error);
-    }
-
-    BptSeparatorPage parent;
-    std::size_t frame = 0;
-    if (!pin_separator(block, parent, frame, error)) {
-        return false;
-    }
-
-    const std::size_t child_pos =
-        parent.routing_child_index(key_bytes.data(), codec_);
-    const std::uint32_t child = child_pos == 0
-        ? parent.first_child()
-        : parent.child(child_pos - 1);
-
-    release(manager_, frame, false);
-
-    Split child_split;
-    if (!insert_aux(child, levels_remaining - 1, key_bytes, rid,
-                    child_split, error)) {
-        return false;
-    }
-
-    if (child_split.new_block == idx::kNoPage) {
-        return true;
-    }
-
-    if (!pin_separator(block, parent, frame, error)) {
-        return false;
-    }
-
-    const idx::IndexEntry incoming{
-        child_split.separator_key, child_split.new_block};
-    const std::size_t count = parent.count();
-    const std::size_t max_keys = max_separator_keys();
-
-    if (count < max_keys) {
-        const bool inserted =
-            parent.insert_pair_after(child_pos, incoming, error);
-        release(manager_, frame, inserted);
-        return inserted;
-    }
-
-    // Assemble the 2d + 1 pairs in memory before splitting.
-    const std::uint32_t first_child = parent.first_child();
-    std::vector<idx::IndexEntry> pairs;
-    pairs.reserve(count + 1);
-
-    for (std::size_t i = 0; i < count; ++i) {
-        pairs.push_back(parent.entry(i));
-    }
-
-    pairs.insert(pairs.begin() + child_pos, incoming);
-
-    const std::size_t middle = min_separator_keys();
-    const auto& promoted = pairs[middle];
-
-    std::uint32_t new_block = idx::kNoPage;
-    std::size_t new_frame = 0;
-    if (!alloc_next_block(new_block, new_frame, error)) {
-        release(manager_, frame, false);
-        return false;
-    }
-
-    BptSeparatorPage right;
-    right.bind(manager_.frame(new_frame).buffer, codec_.width());
-    right.format();
-    right.set_first_child(promoted.child);
-
-    parent.format();
-    parent.set_first_child(first_child);
-
-    for (std::size_t i = 0; i < middle; ++i) {
-        if (!parent.append(pairs[i], error)) {
-            release(manager_, new_frame, true);
-            release(manager_, frame, true);
-            return false;
-        }
-    }
-
-    for (std::size_t i = middle + 1; i < pairs.size(); ++i) {
-        if (!right.append(pairs[i], error)) {
-            release(manager_, new_frame, true);
-            release(manager_, frame, true);
-            return false;
-        }
-    }
-
-    split.separator_key = promoted.key;
-    split.new_block = new_block;
-
-    release(manager_, new_frame, true);
-    release(manager_, frame, true);
-    return true;
 }
 // BPlusTree::insert_leaf — the leaf phase of insert_aux: room within
 // 2d means a plain sorted insert; a full leaf (2d entries) splits per
@@ -1208,81 +1113,8 @@ bool BPlusTree::insert_leaf(std::uint32_t block, const std::string& key_bytes,
     // (equal keys go RIGHT — where the routing sends their duplicates).
     // Fill `split` with the copied-up separator (the new leaf's smallest
     // key) and the new block.
-    error.clear();
-    split = Split{};
 
-    BptLeafPage leaf;
-    std::size_t frame = 0;
-    if (!pin_leaf(block, leaf, frame, error)) {
-        return false;
-    }
 
-    const std::size_t d = min_leaf_entries();
-    if (d == 0 || leaf.count() > max_leaf_entries()) {
-        release(manager_, frame, false);
-        error = "invalid leaf occupancy for insert";
-        return false;
-    }
-
-    const idx::DataEntry incoming{key_bytes, rid};
-    if (leaf.count() < max_leaf_entries()) {
-        const bool inserted = leaf.insert_entry(incoming, codec_, error);
-        release(manager_, frame, inserted);
-        return inserted;
-    }
-
-    const auto last_left = leaf.get_entry(d - 1);
-    const bool goes_left =
-        codec_.compare(key_bytes.data(), last_left.key.data()) < 0;
-    const std::size_t keep = goes_left ? d - 1 : d;
-
-    const std::uint32_t old_next = leaf.next_leaf();
-    BptLeafPage successor;
-    std::size_t successor_frame = 0;
-    if (old_next != idx::kNoPage &&
-        !pin_leaf(old_next, successor, successor_frame, error)) {
-        release(manager_, frame, false);
-        return false;
-    }
-
-    std::uint32_t new_block = idx::kNoPage;
-    std::size_t new_frame = 0;
-    if (!alloc_next_block(new_block, new_frame, error)) {
-        if (old_next != idx::kNoPage) {
-            release(manager_, successor_frame, false);
-        }
-        release(manager_, frame, false);
-        return false;
-    }
-
-    BptLeafPage right;
-    right.bind(manager_.frame(new_frame).buffer, codec_.width());
-    right.format(block, old_next);
-    leaf.move_tail_to(keep, right, codec_.width());
-
-    BptLeafPage& destination = goes_left ? leaf : right;
-    
-    if (!destination.insert_entry(incoming, codec_, error)) {
-        if (old_next != idx::kNoPage) {
-            release(manager_, successor_frame, false);
-        }
-        release(manager_, new_frame, true);
-        release(manager_, frame, true);
-        return false;
-    }
-
-    leaf.set_next_leaf(new_block);
-    if (old_next != idx::kNoPage) {
-        successor.set_prev_leaf(new_block);
-        release(manager_, successor_frame, true);
-    }
-
-    split.separator_key = right.get_entry(0).key;
-    split.new_block = new_block;
-
-    release(manager_, new_frame, true);
-    release(manager_, frame, true);
-    return true;
 }
 
 // --- the recursion contract: erase ----------------------------------------------
@@ -1413,13 +1245,51 @@ bool BPlusTree::erase_rec(std::uint32_t block, std::uint32_t levels_remaining,
     // child (set_separator_key) — or propagate the change upward when
     // the child is the first child. Fill `up` with this page's own
     // post-repair state.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)rid;
-    (void)up;
-    (void)error;
-    return false;
+
+    up=EraseUp{};
+    error.clear();
+
+    if (levels_remaining<=1) {
+        return erase_leaf(block, key_bytes, rid, up, error);
+    }else {
+        BptSeparatorPage father;
+        std::size_t frame_father;
+        if (!pin_separator(block,father, frame_father, error)) {
+            return false;
+        }
+        std::size_t position_child=father.routing_child_index(key_bytes.data(), codec_);
+        //Convertir la posicion en un block
+        std::uint32_t block_child;
+        if (position_child==0) {
+            block_child=father.first_child();
+        }else {
+            block_child=father.child(position_child-1);
+        }
+        release(manager_,frame_father,false);
+
+        EraseUp child_up;
+        if (!erase_rec(block_child, levels_remaining-1,key_bytes, rid, child_up, error)) {
+            return false;
+        }
+        if (child_up.first_changed) {
+            if (position_child>0) {
+                if (!pin_separator(block,father, frame_father, error)) {
+                    return false;
+                }
+                father.set_separator_key(position_child-1,child_up.new_first.data());
+                release(manager_, frame_father, true);
+            }else{
+                up.first_changed=true;
+                up.new_first=child_up.new_first;
+            }
+        }
+        if (child_up.underflow) {
+            return fix_child_underflow(block,levels_remaining,position_child,up, error);
+        }
+
+        return true;
+
+    }
 }
 // BPlusTree::erase_leaf — the leaf phase of erase_rec: find the exact
 // (key, rid) entry in this leaf's equal-key run, erase it (the
@@ -1445,12 +1315,47 @@ bool BPlusTree::erase_leaf(std::uint32_t block, const std::string& key_bytes,
     // fill `up`: underflow when count < min_leaf_entries(); when the
     // erased entry was the first, report whether the first key moved
     // (up.first_changed + up.new_first); an emptied leaf reports both.
-    (void)block;
-    (void)key_bytes;
-    (void)rid;
-    (void)up;
-    (void)error;
-    return false;
+    error.clear();
+    BptLeafPage child_page;
+    std::size_t child_frame;
+    if (!pin_leaf(block, child_page, child_frame,error)) {
+        return false;
+    }
+    bool found=false;
+    std::size_t position_entry=child_page.lower_bound(key_bytes.data(), codec_);
+    std::uint32_t i;
+    for (i=position_entry;i<child_page.count();i++) {
+        idx::DataEntry entry=child_page.get_entry(i);
+        if (codec_.compare(entry.key.data(),key_bytes.data())!=0 ) {
+            break;
+        }
+        if (entry.rid==rid) {
+            found=true;
+            break;
+        }
+    }
+    if (found==true){
+        if (!child_page.erase_entry(i, error)) {
+            release(manager_,child_frame,false );
+            return false;
+        }
+        if (child_page.count()<min_leaf_entries()) {
+            up.underflow=true;
+        }
+        if (i==0 and child_page.count()>0) {
+            up.first_changed=true;
+            up.new_first=child_page.get_entry(0).key;
+        }
+        release(manager_, child_frame, true);
+        return true;
+
+    }else{
+        error="no index entry for key  and rid";
+        release(manager_, child_frame, false);
+        return false;
+    }
+    return true;
+
 }
 // BPlusTree::fix_child_underflow — repairs a child holding fewer than d
 // entries: redistribute with a sibling that can lend (left preferred,
@@ -1480,12 +1385,77 @@ bool BPlusTree::fix_child_underflow(std::uint32_t block,
     // can lend (left preferred, then right — borrow_from_left /
     // borrow_from_right); otherwise merge_child. Fill `up` with this
     // page's own underflow state afterwards (a merge dropped one pair).
-    (void)block;
-    (void)levels_remaining;
-    (void)child_index;
-    (void)up;
-    (void)error;
-    return false;
+    error.clear();
+    up.underflow=false;
+    bool is_leaf;
+    if (levels_remaining==2) {
+        is_leaf=true;
+    }else {
+        is_leaf=false;
+    }
+    BptSeparatorPage father;
+    std::size_t father_frame;
+    if (!pin_separator(block,father,father_frame, error)) {
+        return false;
+    }
+    uint32_t child_block;
+    if (child_index==0) {
+        child_block=father.first_child();
+    }else {
+        child_block=father.child(child_index-1);
+    }
+
+    std::uint32_t left_block = idx::kNoPage;
+    if (child_index == 1) {
+        left_block = father.first_child();
+    } else if (child_index > 1) {
+        //Lee la posicion del hermano, y la posicion de el se lee cild_index-1
+        left_block = father.child((child_index - 1)-1);
+    }
+
+    std::uint32_t right_block = idx::kNoPage;
+    if (child_index < father.count()) {
+        right_block = father.child(child_index);
+    }
+    release(manager_, father_frame, false);
+
+    std::size_t child_count = quick_count(child_block, is_leaf, error);
+    if (!error.empty()) {
+        return false;
+    }
+
+    std::size_t left_count = 0;
+    if (left_block != idx::kNoPage) {
+        left_count = quick_count(left_block, is_leaf, error);
+        if (!error.empty()) {
+            return false;
+        }
+    }
+
+    // Contar el hermano derecho (solo si existe)
+    std::size_t right_count = 0;
+    if (right_block != idx::kNoPage) {
+        right_count = quick_count(right_block, is_leaf, error);
+        if (!error.empty()) {
+            return false;
+        }
+    }
+    std::size_t minimo;
+    if (is_leaf) {
+        minimo=min_leaf_entries();
+    }else {
+        minimo=min_separator_keys();
+    }
+
+    if (left_block!=idx::kNoPage && left_count>minimo) {
+        return borrow_from_left(block,child_index, child_block,left_block,is_leaf,child_count,up,error);
+    }
+
+    if (right_block!=idx::kNoPage && right_count>minimo) {
+        return borrow_from_right(block,child_index, child_block,right_block,is_leaf,child_count,up,error);
+    }
+
+    return merge_child(block, child_index, child_block, left_block, right_block,is_leaf, child_count, up, error);
 }
 // BPlusTree::quick_count — a page's occupancy for the repair decision
 // (can the sibling lend?), read through a short-lived pin.
@@ -1699,6 +1669,73 @@ bool BPlusTree::borrow_from_right(std::uint32_t block, std::size_t child_index,
     // rewrites (or propagates) its left boundary. Separator child:
     // rotate — the sibling's first child and first key move through the
     // parent. Release everything dirty; clear up.underflow.
+
+    //Creamos primero el vector donde se guardara el padre, el hijo y el hermano.
+    std::vector<std::uint32_t> blocks={block,child_block,right_block};
+    //Hacemos pin surgery pin surgery permite pinear varios blocks a la vez
+    std::unordered_map<std::uint32_t, std::size_t> frames;
+    if (!pin_surgery(manager_, file_, blocks,frames ,error )) {
+        return false;
+    }
+    BptSeparatorPage father;
+    father.bind(manager_.frame(frames[block]).buffer,codec_.width());
+    if (child_is_leaf) {
+        //Page del child
+        BptLeafPage child;
+        //Bindear
+        child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+        //Page del hermano
+        BptLeafPage right;
+        right.bind(manager_.frame(frames[right_block]).buffer,codec_.width());
+        //Intercambio
+        idx::DataEntry entry_right=right.get_entry(0);
+        if (!right.erase_entry(0, error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        if (!child.insert_entry(entry_right,codec_,error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        idx::DataEntry entry_new_right=right.get_entry(0);
+        father.set_separator_key(child_index,entry_new_right.key.data());
+        if (child_count==0) {
+            if (child_index==0) {
+                up.first_changed=true;
+                up.new_first=entry_right.key;
+            }else {
+                father.set_separator_key(child_index-1,entry_right.key.data());
+            }
+
+        }
+        release_surgery(manager_, frames);
+        up.underflow=false;
+        return true;
+    }else {
+        BptSeparatorPage child;
+        child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+        BptSeparatorPage right;
+        right.bind(manager_.frame(frames[right_block]).buffer,codec_.width());
+        // Copiar la ultima primera key del hermano
+        const std::string first_key_child(right.separator_key(0), codec_.width());
+        //Copiar su primer hijo
+        std::uint32_t first_child=right.first_child();
+        idx::IndexEntry last_child = right.entry(0);
+        std::string father_sep(father.separator_key(child_index), codec_.width());        //El hijo actual del hijo
+        //std::uint32_t first_child_now=child.first_child();
+        //En el hijo agregar el separador del padre junto con el antiguo primer hijo del hijo
+        if (!child.insert_pair_after(child.count(),idx::IndexEntry{father_sep,first_child},error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        right.set_first_child(last_child.child);
+        right.erase_pair(0,codec_.width());
+        father.set_separator_key(child_index,first_key_child.data());
+        release_surgery(manager_, frames);
+        up.underflow=false;
+        return true;
+
+    }
     (void)block;
     (void)child_index;
     (void)child_block;
@@ -1747,16 +1784,172 @@ bool BPlusTree::merge_child(std::uint32_t block, std::size_t child_index,
     // the separator from the parent (erase_pair), chain the vanished
     // page onto the free list (chain_freed), and report the parent's own
     // underflow upward (up.underflow).
-    (void)block;
-    (void)child_index;
-    (void)child_block;
-    (void)left_block;
-    (void)right_block;
-    (void)child_is_leaf;
-    (void)child_count;
-    (void)up;
-    (void)error;
-    return false;
+
+    //Idea: Ningun hermano puede prestarle al hijo y este quedo con menos entries
+
+
+    if (left_block!=idx::kNoPage) {
+        std::vector<std::uint32_t> blocks={block,child_block,left_block};
+        std::unordered_map<std::uint32_t, std::size_t> frames;
+        if (!pin_surgery(manager_, file_, blocks,frames ,error )) {
+            return false;
+        }
+        BptSeparatorPage father;
+        father.bind(manager_.frame(frames[block]).buffer,codec_.width());
+
+        BptLeafPage child_page_leaf;
+        std::size_t frame_child;
+        //Pinnear el child_page
+
+
+
+        if (child_is_leaf) {
+
+
+            BptLeafPage child;
+            child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+
+            BptLeafPage left;
+            left.bind(manager_.frame(frames[left_block]).buffer,codec_.width());
+
+            std::uint32_t next_leaf_child=child.next_leaf();
+
+
+
+            // Sobrevive el de la izquierda desaparece el hijo
+
+            for (uint32_t i=0;i<child.count();i++) {
+                idx::DataEntry entry=child.get_entry(i);
+                left.insert_entry(entry,codec_,error);
+            }
+
+            left.set_next_leaf(next_leaf_child);
+
+
+            if (next_leaf_child!=idx::kNoPage) {
+                BptLeafPage neighbor;
+                std::size_t frame_neighbor;
+                if (!pin_leaf(next_leaf_child,neighbor,frame_neighbor,error)) {
+                    release_surgery(manager_,frames);
+                    return false;
+                }
+                neighbor.set_prev_leaf(left_block);
+                release(manager_,frame_neighbor,true);
+            }
+        }else {
+            BptSeparatorPage child;
+            child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+
+            BptSeparatorPage left;
+            left.bind(manager_.frame(frames[left_block]).buffer,codec_.width());
+
+
+            std::string father_sep(father.separator_key(child_index-1), codec_.width());        //El hijo actual del hijo
+
+            left.append({father_sep,child.first_child()},error);
+
+            for (uint32_t i=0;i<child.count();i++) {
+                idx::IndexEntry entry=child.entry(i);
+                left.append(entry,error);
+            }
+
+        }
+
+        //Limpiar
+        father.erase_pair(child_index-1,codec_.width());
+        chain_freed(child_block,manager_.frame(frames[child_block]).buffer);
+        if (father.count()<min_separator_keys()) {
+            up.underflow=true;
+        }
+        release_surgery(manager_,frames);
+
+
+    }else {
+        //SObrevie el hijo desparece el de la derecha
+        std::vector<std::uint32_t> blocks={block,child_block,right_block};
+        std::unordered_map<std::uint32_t, std::size_t> frames;
+        if (!pin_surgery(manager_, file_, blocks,frames ,error )) {
+            return false;
+        }
+        BptSeparatorPage father;
+        father.bind(manager_.frame(frames[block]).buffer,codec_.width());
+
+        BptLeafPage child_page_leaf;
+        std::size_t frame_child;
+
+        if (child_is_leaf) {
+
+
+            BptLeafPage child;
+            child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+
+            BptLeafPage right;
+            right.bind(manager_.frame(frames[right_block]).buffer,codec_.width());
+
+
+            std::uint32_t next_leaf_child=right.next_leaf();
+
+
+
+            // Sobrevive el de la drecha desaparece el hijo
+
+            for (uint32_t i=0;i<right.count();i++) {
+                idx::DataEntry entry=right.get_entry(i);
+                child.insert_entry(entry,codec_,error);
+            }
+
+            child.set_next_leaf(next_leaf_child);
+
+
+            if (next_leaf_child!=idx::kNoPage) {
+                BptLeafPage neighbor;
+                std::size_t frame_neighbor;
+                if (!pin_leaf(next_leaf_child,neighbor,frame_neighbor,error)) {
+                    release_surgery(manager_,frames);
+                    return false;
+                }
+                neighbor.set_prev_leaf(child_block);
+                release(manager_, frame_neighbor, true);
+            }
+
+            if (child_count==0) {
+                up.first_changed=true;
+                up.new_first=right.get_entry(0).key;
+            }
+
+        }
+        else {
+            BptSeparatorPage child;
+            child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+
+            BptSeparatorPage right;
+            right.bind(manager_.frame(frames[right_block]).buffer,codec_.width());
+
+
+            std::string father_sep(father.separator_key(child_index), codec_.width());        //El hijo actual del hijo
+
+            child.append({father_sep,right.first_child()},error);
+
+            for (uint32_t i=0;i<right.count();i++) {
+                idx::IndexEntry entry=right.entry(i);
+                child.append(entry,error);
+            }
+
+
+        }
+
+        father.erase_pair(child_index,codec_.width());
+        chain_freed(right_block,manager_.frame(frames[right_block]).buffer);
+        if (father.count()<min_separator_keys()) {
+            up.underflow=true;
+        }
+        release_surgery(manager_,frames);
+
+
+
+    }
+
+    return true;
 }
 // BPlusTree::rebuild_from_leaves — the crossed-subtree erase's simple
 // correct repair: collect every entry by walking the leaf chain, close
