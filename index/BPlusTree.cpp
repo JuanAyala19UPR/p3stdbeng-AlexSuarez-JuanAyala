@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cstring>
+#include <format>
 #include <unordered_map>
+
+#include "IndexPages.h"
 
 namespace bptree {
 
@@ -16,6 +19,7 @@ void release(bufman::BufferManager& manager, std::size_t frame,
              bool was_dirty) {
     std::string unpin_error;
     manager.unpin(frame, was_dirty, unpin_error);
+
 }
 
 constexpr std::uint32_t kBptMagic = 0x31545042u; // "BPT1"
@@ -609,11 +613,35 @@ std::uint32_t BPlusTree::tree_search(std::uint32_t block,
     // (routing_child_index), release the pin, and recurse into that
     // child with levels_remaining - 1. An empty tree (kNoPage) also
     // returns kNoPage.
+    if (block==idx::kNoPage) {
+        return idx::kNoPage;
+    }
+    if (levels_remaining==1) {
+        return block;
+    }else{
+        BptSeparatorPage separator;
+        std::size_t frame=0;
+        if (!pin_separator(block, separator, frame, error)) {
+            return idx::kNoPage;
+        }
+        std::uint32_t  block_child=0;
+        std::size_t position=separator.routing_child_index(key_bytes.data(),codec_);
+        if (position==0) {
+            block_child=separator.first_child();
+        }else {
+            block_child=separator.child(position-1);
+        }
+        release(manager_, frame, false);
+        return tree_search(block_child,levels_remaining-1,key_bytes,error);
+
+    }
+    /*
     (void)block;
     (void)levels_remaining;
     (void)key_bytes;
     (void)error;
     return idx::kNoPage;
+    */
 }
 // BPlusTree::run_start — the equal-key run's leftmost leaf: walks left
 // from the landing leaf while the previous leaf's LAST key EQUALS the
@@ -629,21 +657,65 @@ std::uint32_t BPlusTree::tree_search(std::uint32_t block,
 //
 // Returns: the run's first leaf's block id (the landing itself when no
 // left neighbour's tail equals the target); kNoPage on a pin failure.
-std::uint32_t BPlusTree::run_start(std::uint32_t landing,
-                                   const std::string& key_bytes,
-                                   std::string& error) {
-    // TODO(student): the equal-key run's leftmost leaf (design D4).
-    // Walk left from `landing` while the PREVIOUS leaf's LAST key equals
-    // the target (exact equality — a >= test over-walks): pin the
-    // current leaf, read its prev link, release; pin the previous leaf,
-    // compare its last entry's key with key_bytes, release; stop and
-    // return `current` when prev is kNoPage or the tail does not equal
-    // the target, else continue from prev.
-    (void)landing;
-    (void)key_bytes;
-    (void)error;
-    return idx::kNoPage;
-}
+ std::uint32_t BPlusTree::run_start(std::uint32_t landing,
+                                       const std::string& key_bytes,
+                                       std::string& error) {
+        // TODO(student): the equal-key run's leftmost leaf (design D4).
+        // Walk left from `landing` while the PREVIOUS leaf's LAST key equals
+        // the target (exact equality — a >= test over-walks): pin the
+        // current leaf, read its prev link, release; pin the previous leaf,
+        // compare its last entry's key with key_bytes, release; stop and
+        // return `current` when prev is kNoPage or the tail does not equal
+        // the target, else continue from prev.
+
+        //Este  metodo lo que hace es mirar si la key esta en el ultimo entrie de las anteriores leaf, debido a ello necesita un buclie
+        std::uint32_t block_response=landing;
+        bool correcto=true;
+
+        while (correcto) {
+
+            BptLeafPage leaf;
+            std::size_t frame;
+            if (!pin_leaf(block_response,leaf, frame, error)) {
+                return idx::kNoPage;
+            }
+
+            if (leaf.prev_leaf()==idx::kNoPage) {
+                release(manager_,frame, false);
+                return block_response;
+            }
+
+            std::uint32_t block_prev=leaf.prev_leaf();
+            BptLeafPage leaf_prev;
+            std::size_t frame_prev;
+
+            if (!pin_leaf(block_prev, leaf_prev, frame_prev, error)) {
+                release(manager_,frame, false);
+                return idx::kNoPage;
+
+            }
+            if (leaf_prev.count()==0) {
+                release(manager_,frame, false);
+                release(manager_,frame_prev, false);
+                return block_response;
+            }
+            std::string key_leaf_prev=leaf_prev.get_entry(leaf_prev.count()-1).key;
+            if (codec_.compare(key_leaf_prev.data(),key_bytes.data())==0) {
+                block_response=block_prev;
+            }else {
+                correcto=false;
+            }
+            release(manager_,frame_prev, false);
+            release(manager_,frame, false);
+        }
+
+
+        return block_response;
+        //(void)landing;
+        //(void)key_bytes;
+        //(void)error;
+        //return idx::kNoPage;
+    }
 // BPlusTree::gather_run — collects every entry whose key equals the
 // target, scanning leaves left to right from `start`: the run continues
 // while a leaf's last key still compares equal. Lookup's answer walk.
@@ -663,11 +735,42 @@ bool BPlusTree::gather_run(const std::string& key_bytes, std::uint32_t start,
     // while keys compare equal, pushing each entry's rid into `out`;
     // the run continues into next_leaf while the leaf's LAST key equals
     // the target. Stop at the first leaf whose last key differs.
-    (void)key_bytes;
-    (void)start;
-    (void)out;
-    (void)error;
-    return false;
+     error.clear();
+
+    for (std::uint32_t current = start; current != idx::kNoPage;) {
+        BptLeafPage leaf;
+        std::size_t frame = 0;
+
+        if (!pin_leaf(current, leaf, frame, error)) {
+            return false;
+        }
+
+        const std::size_t count = leaf.count();
+        const std::size_t first = leaf.lower_bound(key_bytes.data(), codec_);
+
+        for (std::size_t i = first; i < count; ++i) {
+            const auto entry = leaf.get_entry(i);
+
+            if (codec_.compare(entry.key.data(), key_bytes.data()) != 0) {
+                break;
+            }
+
+            out.push_back(entry.rid);
+        }
+
+        const bool continues =
+            count != 0 &&
+            codec_.compare(leaf.get_entry(count - 1).key.data(),
+                           key_bytes.data()) == 0;
+
+        const std::uint32_t next =
+            continues ? leaf.next_leaf() : idx::kNoPage;
+
+        release(manager_, frame, false);
+        current = next;
+    }
+
+    return true;
 }
 // BPlusTree::locate_in_run — finds the exact (key, rid) entry within
 // the equal-key run: the leaves are scanned for the pair, so the erase
@@ -694,12 +797,49 @@ bool BPlusTree::locate_in_run(const std::string& key_bytes, idx::Rid rid,
     // out-parameters. Continue into next_leaf while the last key equals
     // the target; a run that exhausts without the rid is a named error
     // ("no index entry for key ... and rid ...").
-    (void)key_bytes;
-    (void)rid;
-    (void)start;
-    (void)leaf_block;
-    (void)pos;
-    (void)error;
+    error.clear();
+
+    for (std::uint32_t current = start; current != idx::kNoPage;) {
+        BptLeafPage leaf;
+        std::size_t frame = 0;
+
+        if (!pin_leaf(current, leaf, frame, error)) {
+            return false;
+        }
+
+        const std::size_t count = leaf.count();
+        const std::size_t first = leaf.lower_bound(key_bytes.data(), codec_);
+
+        for (std::size_t i = first; i < count; ++i) {
+            const auto entry = leaf.get_entry(i);
+
+            if (codec_.compare(entry.key.data(), key_bytes.data()) != 0) {
+                break;
+            }
+
+            if (entry.rid == rid) {
+                leaf_block = current;
+                pos = i;
+                release(manager_, frame, false);
+                return true;
+            }
+        }
+
+        const bool continues =
+            count != 0 &&
+            codec_.compare(leaf.get_entry(count - 1).key.data(),
+                           key_bytes.data()) == 0;
+
+        const std::uint32_t next =
+            continues ? leaf.next_leaf() : idx::kNoPage;
+
+        release(manager_, frame, false);
+        current = next;
+    }
+
+    error = "no index entry for key " + codec_.display(key_bytes.data()) +
+            " and rid (" + std::to_string(rid.page_id) + ", " +
+            std::to_string(rid.slot) + ")";
     return false;
 }
 // BPlusTree::lookup — all entries whose key equals `key`: descend by
@@ -834,7 +974,7 @@ bool BPlusTree::range(const std::optional<RangeBound>& lo,
 
 // --- the recursion contract: insert --------------------------------------------
 // BPlusTree::insert — the lecture's insert (slide 34) as a wrapper: an
-// empty index grows its first leaf; otherwise insert_aux descends and
+// empty index grows its first leaf; otherwise aux descends and
 // the wrapper allocates a new root when the old root split (the height
 // grows by exactly one). entry_count_ and the header follow.
 //
@@ -941,13 +1081,106 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
     // its child becomes the new page's first child
     // (move_tail_to(middle + 1)), filling `split` for the parent. The
     // wrapper turns a root split into a new root.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)rid;
-    (void)split;
-    (void)error;
-    return false;
+
+   error.clear();
+    split = Split{};
+
+    if (levels_remaining <= 1) {
+        return insert_leaf(block, key_bytes, rid, split, error);
+    }
+
+    BptSeparatorPage parent;
+    std::size_t frame = 0;
+    if (!pin_separator(block, parent, frame, error)) {
+        return false;
+    }
+
+    const std::size_t child_pos =
+        parent.routing_child_index(key_bytes.data(), codec_);
+    const std::uint32_t child = child_pos == 0
+        ? parent.first_child()
+        : parent.child(child_pos - 1);
+
+    release(manager_, frame, false);
+
+    Split child_split;
+    if (!insert_aux(child, levels_remaining - 1, key_bytes, rid,
+                    child_split, error)) {
+        return false;
+    }
+
+    if (child_split.new_block == idx::kNoPage) {
+        return true;
+    }
+
+    if (!pin_separator(block, parent, frame, error)) {
+        return false;
+    }
+
+    const idx::IndexEntry incoming{
+        child_split.separator_key, child_split.new_block};
+    const std::size_t count = parent.count();
+    const std::size_t max_keys = max_separator_keys();
+
+    if (count < max_keys) {
+        const bool inserted =
+            parent.insert_pair_after(child_pos, incoming, error);
+        release(manager_, frame, inserted);
+        return inserted;
+    }
+
+    // Assemble the 2d + 1 pairs in memory before splitting.
+    const std::uint32_t first_child = parent.first_child();
+    std::vector<idx::IndexEntry> pairs;
+    pairs.reserve(count + 1);
+
+    for (std::size_t i = 0; i < count; ++i) {
+        pairs.push_back(parent.entry(i));
+    }
+
+    pairs.insert(pairs.begin() + child_pos, incoming);
+
+    const std::size_t middle = min_separator_keys();
+    const auto& promoted = pairs[middle];
+
+    std::uint32_t new_block = idx::kNoPage;
+    std::size_t new_frame = 0;
+    if (!alloc_next_block(new_block, new_frame, error)) {
+        release(manager_, frame, false);
+        return false;
+    }
+
+    BptSeparatorPage right;
+    right.bind(manager_.frame(new_frame).buffer, codec_.width());
+    right.format();
+    right.set_first_child(promoted.child);
+
+    parent.format();
+    parent.set_first_child(first_child);
+
+    for (std::size_t i = 0; i < middle; ++i) {
+        if (!parent.append(pairs[i], error)) {
+            release(manager_, new_frame, true);
+            release(manager_, frame, true);
+            return false;
+        }
+    }
+
+    for (std::size_t i = middle + 1; i < pairs.size(); ++i) {
+        if (!right.append(pairs[i], error)) {
+            release(manager_, new_frame, true);
+            release(manager_, frame, true);
+            return false;
+        }
+    }
+
+    split.separator_key = promoted.key;
+    split.new_block = new_block;
+
+    release(manager_, new_frame, true);
+    release(manager_, frame, true);
+    return true;
+
 }
 // BPlusTree::insert_leaf — the leaf phase of insert_aux: room within
 // 2d means a plain sorted insert; a full leaf (2d entries) splits per
@@ -979,12 +1212,84 @@ bool BPlusTree::insert_leaf(std::uint32_t block, const std::string& key_bytes,
     // (equal keys go RIGHT — where the routing sends their duplicates).
     // Fill `split` with the copied-up separator (the new leaf's smallest
     // key) and the new block.
-    (void)block;
-    (void)key_bytes;
-    (void)rid;
-    (void)split;
-    (void)error;
-    return false;
+
+  error.clear();
+    split = Split{};
+
+    BptLeafPage leaf;
+    std::size_t frame = 0;
+    if (!pin_leaf(block, leaf, frame, error)) {
+        return false;
+    }
+
+    const std::size_t d = min_leaf_entries();
+    if (d == 0 || leaf.count() > max_leaf_entries()) {
+        release(manager_, frame, false);
+        error = "invalid leaf occupancy for insert";
+        return false;
+    }
+
+    const idx::DataEntry incoming{key_bytes, rid};
+    if (leaf.count() < max_leaf_entries()) {
+        const bool inserted = leaf.insert_entry(incoming, codec_, error);
+        release(manager_, frame, inserted);
+        return inserted;
+    }
+
+    const auto last_left = leaf.get_entry(d - 1);
+    const bool goes_left =
+        codec_.compare(key_bytes.data(), last_left.key.data()) < 0;
+    const std::size_t keep = goes_left ? d - 1 : d;
+
+    const std::uint32_t old_next = leaf.next_leaf();
+    BptLeafPage successor;
+    std::size_t successor_frame = 0;
+    if (old_next != idx::kNoPage &&
+        !pin_leaf(old_next, successor, successor_frame, error)) {
+        release(manager_, frame, false);
+        return false;
+    }
+
+    std::uint32_t new_block = idx::kNoPage;
+    std::size_t new_frame = 0;
+    if (!alloc_next_block(new_block, new_frame, error)) {
+        if (old_next != idx::kNoPage) {
+            release(manager_, successor_frame, false);
+        }
+        release(manager_, frame, false);
+        return false;
+    }
+
+    BptLeafPage right;
+    right.bind(manager_.frame(new_frame).buffer, codec_.width());
+    right.format(block, old_next);
+    leaf.move_tail_to(keep, right, codec_.width());
+
+    BptLeafPage& destination = goes_left ? leaf : right;
+
+    if (!destination.insert_entry(incoming, codec_, error)) {
+        if (old_next != idx::kNoPage) {
+            release(manager_, successor_frame, false);
+        }
+        release(manager_, new_frame, true);
+        release(manager_, frame, true);
+        return false;
+    }
+
+    leaf.set_next_leaf(new_block);
+    if (old_next != idx::kNoPage) {
+        successor.set_prev_leaf(new_block);
+        release(manager_, successor_frame, true);
+    }
+
+    split.separator_key = right.get_entry(0).key;
+    split.new_block = new_block;
+
+    release(manager_, new_frame, true);
+    release(manager_, frame, true);
+    return true;
+
+
 }
 
 // --- the recursion contract: erase ----------------------------------------------
@@ -1115,13 +1420,51 @@ bool BPlusTree::erase_rec(std::uint32_t block, std::uint32_t levels_remaining,
     // child (set_separator_key) — or propagate the change upward when
     // the child is the first child. Fill `up` with this page's own
     // post-repair state.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)rid;
-    (void)up;
-    (void)error;
-    return false;
+
+    up=EraseUp{};
+    error.clear();
+
+    if (levels_remaining<=1) {
+        return erase_leaf(block, key_bytes, rid, up, error);
+    }else {
+        BptSeparatorPage father;
+        std::size_t frame_father;
+        if (!pin_separator(block,father, frame_father, error)) {
+            return false;
+        }
+        std::size_t position_child=father.routing_child_index(key_bytes.data(), codec_);
+        //Convertir la posicion en un block
+        std::uint32_t block_child;
+        if (position_child==0) {
+            block_child=father.first_child();
+        }else {
+            block_child=father.child(position_child-1);
+        }
+        release(manager_,frame_father,false);
+
+        EraseUp child_up;
+        if (!erase_rec(block_child, levels_remaining-1,key_bytes, rid, child_up, error)) {
+            return false;
+        }
+        if (child_up.first_changed) {
+            if (position_child>0) {
+                if (!pin_separator(block,father, frame_father, error)) {
+                    return false;
+                }
+                father.set_separator_key(position_child-1,child_up.new_first.data());
+                release(manager_, frame_father, true);
+            }else{
+                up.first_changed=true;
+                up.new_first=child_up.new_first;
+            }
+        }
+        if (child_up.underflow) {
+            return fix_child_underflow(block,levels_remaining,position_child,up, error);
+        }
+
+        return true;
+
+    }
 }
 // BPlusTree::erase_leaf — the leaf phase of erase_rec: find the exact
 // (key, rid) entry in this leaf's equal-key run, erase it (the
@@ -1147,12 +1490,47 @@ bool BPlusTree::erase_leaf(std::uint32_t block, const std::string& key_bytes,
     // fill `up`: underflow when count < min_leaf_entries(); when the
     // erased entry was the first, report whether the first key moved
     // (up.first_changed + up.new_first); an emptied leaf reports both.
-    (void)block;
-    (void)key_bytes;
-    (void)rid;
-    (void)up;
-    (void)error;
-    return false;
+    error.clear();
+    BptLeafPage child_page;
+    std::size_t child_frame;
+    if (!pin_leaf(block, child_page, child_frame,error)) {
+        return false;
+    }
+    bool found=false;
+    std::size_t position_entry=child_page.lower_bound(key_bytes.data(), codec_);
+    std::uint32_t i;
+    for (i=position_entry;i<child_page.count();i++) {
+        idx::DataEntry entry=child_page.get_entry(i);
+        if (codec_.compare(entry.key.data(),key_bytes.data())!=0 ) {
+            break;
+        }
+        if (entry.rid==rid) {
+            found=true;
+            break;
+        }
+    }
+    if (found==true){
+        if (!child_page.erase_entry(i, error)) {
+            release(manager_,child_frame,false );
+            return false;
+        }
+        if (child_page.count()<min_leaf_entries()) {
+            up.underflow=true;
+        }
+        if (i==0 and child_page.count()>0) {
+            up.first_changed=true;
+            up.new_first=child_page.get_entry(0).key;
+        }
+        release(manager_, child_frame, true);
+        return true;
+
+    }else{
+        error="no index entry for key  and rid";
+        release(manager_, child_frame, false);
+        return false;
+    }
+    return true;
+
 }
 // BPlusTree::fix_child_underflow — repairs a child holding fewer than d
 // entries: redistribute with a sibling that can lend (left preferred,
@@ -1182,12 +1560,77 @@ bool BPlusTree::fix_child_underflow(std::uint32_t block,
     // can lend (left preferred, then right — borrow_from_left /
     // borrow_from_right); otherwise merge_child. Fill `up` with this
     // page's own underflow state afterwards (a merge dropped one pair).
-    (void)block;
-    (void)levels_remaining;
-    (void)child_index;
-    (void)up;
-    (void)error;
-    return false;
+    error.clear();
+    up.underflow=false;
+    bool is_leaf;
+    if (levels_remaining==2) {
+        is_leaf=true;
+    }else {
+        is_leaf=false;
+    }
+    BptSeparatorPage father;
+    std::size_t father_frame;
+    if (!pin_separator(block,father,father_frame, error)) {
+        return false;
+    }
+    uint32_t child_block;
+    if (child_index==0) {
+        child_block=father.first_child();
+    }else {
+        child_block=father.child(child_index-1);
+    }
+
+    std::uint32_t left_block = idx::kNoPage;
+    if (child_index == 1) {
+        left_block = father.first_child();
+    } else if (child_index > 1) {
+        //Lee la posicion del hermano, y la posicion de el se lee cild_index-1
+        left_block = father.child((child_index - 1)-1);
+    }
+
+    std::uint32_t right_block = idx::kNoPage;
+    if (child_index < father.count()) {
+        right_block = father.child(child_index);
+    }
+    release(manager_, father_frame, false);
+
+    std::size_t child_count = quick_count(child_block, is_leaf, error);
+    if (!error.empty()) {
+        return false;
+    }
+
+    std::size_t left_count = 0;
+    if (left_block != idx::kNoPage) {
+        left_count = quick_count(left_block, is_leaf, error);
+        if (!error.empty()) {
+            return false;
+        }
+    }
+
+    // Contar el hermano derecho (solo si existe)
+    std::size_t right_count = 0;
+    if (right_block != idx::kNoPage) {
+        right_count = quick_count(right_block, is_leaf, error);
+        if (!error.empty()) {
+            return false;
+        }
+    }
+    std::size_t minimo;
+    if (is_leaf) {
+        minimo=min_leaf_entries();
+    }else {
+        minimo=min_separator_keys();
+    }
+
+    if (left_block!=idx::kNoPage && left_count>minimo) {
+        return borrow_from_left(block,child_index, child_block,left_block,is_leaf,child_count,up,error);
+    }
+
+    if (right_block!=idx::kNoPage && right_count>minimo) {
+        return borrow_from_right(block,child_index, child_block,right_block,is_leaf,child_count,up,error);
+    }
+
+    return merge_child(block, child_index, child_block, left_block, right_block,is_leaf, child_count, up, error);
 }
 // BPlusTree::quick_count — a page's occupancy for the repair decision
 // (can the sibling lend?), read through a short-lived pin.
@@ -1267,7 +1710,7 @@ void release_surgery(bufman::BufferManager& manager,
 // to stay exact. Surgery pins in ascending block order, first.
 //
 // Parameters:
-//   block: the parent's block id.
+//   block: the parent's block id.borrow_from_left
 //   child_index: the underflowed child's routing position (> 0 — a
 //     left borrow needs a left sibling).
 //   child_block: the child's block id.
@@ -1292,6 +1735,70 @@ bool BPlusTree::borrow_from_left(std::uint32_t block, std::size_t child_index,
     // key move through the parent (the child's new first child and first
     // key; the parent's separator becomes the moved key). Release
     // everything dirty; clear up.underflow.
+    (void)child_count;
+    //Creamos primero el vector donde se guardara el padre, el hijo y el hermano.
+    std::vector<std::uint32_t> blocks={block,child_block,left_block};
+    //Hacemos pin surgery pin surgery permite pinear varios blocks a la vez
+    std::unordered_map<std::uint32_t, std::size_t> frames;
+    if (!pin_surgery(manager_, file_, blocks,frames ,error )) {
+        return false;
+    }
+    BptSeparatorPage father;
+    father.bind(manager_.frame(frames[block]).buffer,codec_.width());
+
+    //No se usan
+    //std::uint32_t position_child=father.child(child_index);
+    //std:uint32_t position_left=father.child(child_index-1);
+    //const char* father_separator=father.separator_key(child_index-1);
+    //Conectar las vistas
+    if (child_is_leaf) {
+        //Page del child
+        BptLeafPage child;
+        //Bindear
+        child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+        //Page del hermano
+        BptLeafPage left;
+        left.bind(manager_.frame(frames[left_block]).buffer,codec_.width());
+        //Intercambio
+        idx::DataEntry entry_left=left.get_entry(left.count()-1);
+        if (!left.erase_entry(left.count()-1, error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        if (!child.insert_entry(entry_left,codec_,error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        father.set_separator_key(child_index-1,entry_left.key.c_str());
+        release_surgery(manager_, frames);
+        up.underflow=false;
+        return true;
+    }else {
+        BptSeparatorPage child;
+        child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+        BptSeparatorPage left;
+        left.bind(manager_.frame(frames[left_block]).buffer,codec_.width());
+        // Copiar la ultima key del hermano
+        const std::string last_key_child(left.separator_key(left.count() - 1), codec_.width());
+        //Copiar su ultimo hijo
+        idx::IndexEntry last_child=left.entry(left.count()-1);
+        std::string father_sep(father.separator_key(child_index - 1), codec_.width());        //El hijo actual del hijo
+        std::uint32_t first_child_now=child.first_child();
+        //En el hijo agregar el separador del padre junto con el antiguo primer hijo del hijo
+        if (!child.insert_pair_after(0,idx::IndexEntry{father_sep,first_child_now},error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        child.set_first_child(last_child.child);
+        left.erase_pair(left.count()-1,codec_.width());
+        father.set_separator_key(child_index-1,last_key_child.data());
+        release_surgery(manager_, frames);
+        up.underflow=false;
+        return true;
+    }
+
+
+    /*
     (void)block;
     (void)child_index;
     (void)child_block;
@@ -1301,6 +1808,7 @@ bool BPlusTree::borrow_from_left(std::uint32_t block, std::size_t child_index,
     (void)up;
     (void)error;
     return false;
+    */
 }
 // BPlusTree::borrow_from_right — redistribution from the right sibling
 // (slide 41): a leaf child gains the sibling's first entry at its end;
@@ -1336,6 +1844,73 @@ bool BPlusTree::borrow_from_right(std::uint32_t block, std::size_t child_index,
     // rewrites (or propagates) its left boundary. Separator child:
     // rotate — the sibling's first child and first key move through the
     // parent. Release everything dirty; clear up.underflow.
+
+    //Creamos primero el vector donde se guardara el padre, el hijo y el hermano.
+    std::vector<std::uint32_t> blocks={block,child_block,right_block};
+    //Hacemos pin surgery pin surgery permite pinear varios blocks a la vez
+    std::unordered_map<std::uint32_t, std::size_t> frames;
+    if (!pin_surgery(manager_, file_, blocks,frames ,error )) {
+        return false;
+    }
+    BptSeparatorPage father;
+    father.bind(manager_.frame(frames[block]).buffer,codec_.width());
+    if (child_is_leaf) {
+        //Page del child
+        BptLeafPage child;
+        //Bindear
+        child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+        //Page del hermano
+        BptLeafPage right;
+        right.bind(manager_.frame(frames[right_block]).buffer,codec_.width());
+        //Intercambio
+        idx::DataEntry entry_right=right.get_entry(0);
+        if (!right.erase_entry(0, error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        if (!child.insert_entry(entry_right,codec_,error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        idx::DataEntry entry_new_right=right.get_entry(0);
+        father.set_separator_key(child_index,entry_new_right.key.data());
+        if (child_count==0) {
+            if (child_index==0) {
+                up.first_changed=true;
+                up.new_first=entry_right.key;
+            }else {
+                father.set_separator_key(child_index-1,entry_right.key.data());
+            }
+
+        }
+        release_surgery(manager_, frames);
+        up.underflow=false;
+        return true;
+    }else {
+        BptSeparatorPage child;
+        child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+        BptSeparatorPage right;
+        right.bind(manager_.frame(frames[right_block]).buffer,codec_.width());
+        // Copiar la ultima primera key del hermano
+        const std::string first_key_child(right.separator_key(0), codec_.width());
+        //Copiar su primer hijo
+        std::uint32_t first_child=right.first_child();
+        idx::IndexEntry last_child = right.entry(0);
+        std::string father_sep(father.separator_key(child_index), codec_.width());        //El hijo actual del hijo
+        //std::uint32_t first_child_now=child.first_child();
+        //En el hijo agregar el separador del padre junto con el antiguo primer hijo del hijo
+        if (!child.insert_pair_after(child.count(),idx::IndexEntry{father_sep,first_child},error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        right.set_first_child(last_child.child);
+        right.erase_pair(0,codec_.width());
+        father.set_separator_key(child_index,first_key_child.data());
+        release_surgery(manager_, frames);
+        up.underflow=false;
+        return true;
+
+    }
     (void)block;
     (void)child_index;
     (void)child_block;
@@ -1384,16 +1959,172 @@ bool BPlusTree::merge_child(std::uint32_t block, std::size_t child_index,
     // the separator from the parent (erase_pair), chain the vanished
     // page onto the free list (chain_freed), and report the parent's own
     // underflow upward (up.underflow).
-    (void)block;
-    (void)child_index;
-    (void)child_block;
-    (void)left_block;
-    (void)right_block;
-    (void)child_is_leaf;
-    (void)child_count;
-    (void)up;
-    (void)error;
-    return false;
+
+    //Idea: Ningun hermano puede prestarle al hijo y este quedo con menos entries
+
+
+    if (left_block!=idx::kNoPage) {
+        std::vector<std::uint32_t> blocks={block,child_block,left_block};
+        std::unordered_map<std::uint32_t, std::size_t> frames;
+        if (!pin_surgery(manager_, file_, blocks,frames ,error )) {
+            return false;
+        }
+        BptSeparatorPage father;
+        father.bind(manager_.frame(frames[block]).buffer,codec_.width());
+
+        BptLeafPage child_page_leaf;
+        std::size_t frame_child;
+        //Pinnear el child_page
+
+
+
+        if (child_is_leaf) {
+
+
+            BptLeafPage child;
+            child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+
+            BptLeafPage left;
+            left.bind(manager_.frame(frames[left_block]).buffer,codec_.width());
+
+            std::uint32_t next_leaf_child=child.next_leaf();
+
+
+
+            // Sobrevive el de la izquierda desaparece el hijo
+
+            for (uint32_t i=0;i<child.count();i++) {
+                idx::DataEntry entry=child.get_entry(i);
+                left.insert_entry(entry,codec_,error);
+            }
+
+            left.set_next_leaf(next_leaf_child);
+
+
+            if (next_leaf_child!=idx::kNoPage) {
+                BptLeafPage neighbor;
+                std::size_t frame_neighbor;
+                if (!pin_leaf(next_leaf_child,neighbor,frame_neighbor,error)) {
+                    release_surgery(manager_,frames);
+                    return false;
+                }
+                neighbor.set_prev_leaf(left_block);
+                release(manager_,frame_neighbor,true);
+            }
+        }else {
+            BptSeparatorPage child;
+            child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+
+            BptSeparatorPage left;
+            left.bind(manager_.frame(frames[left_block]).buffer,codec_.width());
+
+
+            std::string father_sep(father.separator_key(child_index-1), codec_.width());        //El hijo actual del hijo
+
+            left.append({father_sep,child.first_child()},error);
+
+            for (uint32_t i=0;i<child.count();i++) {
+                idx::IndexEntry entry=child.entry(i);
+                left.append(entry,error);
+            }
+
+        }
+
+        //Limpiar
+        father.erase_pair(child_index-1,codec_.width());
+        chain_freed(child_block,manager_.frame(frames[child_block]).buffer);
+        if (father.count()<min_separator_keys()) {
+            up.underflow=true;
+        }
+        release_surgery(manager_,frames);
+
+
+    }else {
+        //SObrevie el hijo desparece el de la derecha
+        std::vector<std::uint32_t> blocks={block,child_block,right_block};
+        std::unordered_map<std::uint32_t, std::size_t> frames;
+        if (!pin_surgery(manager_, file_, blocks,frames ,error )) {
+            return false;
+        }
+        BptSeparatorPage father;
+        father.bind(manager_.frame(frames[block]).buffer,codec_.width());
+
+        BptLeafPage child_page_leaf;
+        std::size_t frame_child;
+
+        if (child_is_leaf) {
+
+
+            BptLeafPage child;
+            child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+
+            BptLeafPage right;
+            right.bind(manager_.frame(frames[right_block]).buffer,codec_.width());
+
+
+            std::uint32_t next_leaf_child=right.next_leaf();
+
+
+
+            // Sobrevive el de la drecha desaparece el hijo
+
+            for (uint32_t i=0;i<right.count();i++) {
+                idx::DataEntry entry=right.get_entry(i);
+                child.insert_entry(entry,codec_,error);
+            }
+
+            child.set_next_leaf(next_leaf_child);
+
+
+            if (next_leaf_child!=idx::kNoPage) {
+                BptLeafPage neighbor;
+                std::size_t frame_neighbor;
+                if (!pin_leaf(next_leaf_child,neighbor,frame_neighbor,error)) {
+                    release_surgery(manager_,frames);
+                    return false;
+                }
+                neighbor.set_prev_leaf(child_block);
+                release(manager_, frame_neighbor, true);
+            }
+
+            if (child_count==0) {
+                up.first_changed=true;
+                up.new_first=right.get_entry(0).key;
+            }
+
+        }
+        else {
+            BptSeparatorPage child;
+            child.bind(manager_.frame(frames[child_block]).buffer,codec_.width());
+
+            BptSeparatorPage right;
+            right.bind(manager_.frame(frames[right_block]).buffer,codec_.width());
+
+
+            std::string father_sep(father.separator_key(child_index), codec_.width());        //El hijo actual del hijo
+
+            child.append({father_sep,right.first_child()},error);
+
+            for (uint32_t i=0;i<right.count();i++) {
+                idx::IndexEntry entry=right.entry(i);
+                child.append(entry,error);
+            }
+
+
+        }
+
+        father.erase_pair(child_index,codec_.width());
+        chain_freed(right_block,manager_.frame(frames[right_block]).buffer);
+        if (father.count()<min_separator_keys()) {
+            up.underflow=true;
+        }
+        release_surgery(manager_,frames);
+
+
+
+    }
+
+    return true;
 }
 // BPlusTree::rebuild_from_leaves — the crossed-subtree erase's simple
 // correct repair: collect every entry by walking the leaf chain, close
@@ -1613,13 +2344,130 @@ bool BPlusTree::verify_rec(std::uint32_t block, std::uint32_t depth,
     // minimum upward. At a leaf: order, every rid judged through
     // occupied (dangling findings), walked += count, depth range
     // updated, and the subtree minimum reported (nullopt when empty).
+
+    if (block>=walk.seen.size()) {
+        walk.findings.push_back("block " + std::to_string(block) +"is beyond the file");
+        return true;
+    }
+    if (walk.seen[block]==1) {
+        walk.findings.push_back("block "+std::to_string(block)+" is reachable twice");
+        return true;
+    }
+
+    walk.seen[block]=1;
+
+    // Case for separators
+    if (depth<levels_) {
+
+        std::size_t frame=0;
+        BptSeparatorPage separator;
+        if (!pin_separator(block, separator, frame, error)) {
+            return false;
+        }
+        //Regla de ocupacion
+        if (!is_root && (separator.count()<min_separator_keys() ||
+                         separator.count()>max_separator_keys() ) ) {
+            walk.findings.push_back("block"+std::to_string(block)+"has a bad key count");
+        }
+
+        depth+=1;
+
+        auto first_child=separator.first_child();
+        std::optional<std::string> subtree_min_first;
+        if (!verify_rec(
+            first_child,depth,false, walk,error, &subtree_min_first)) {
+            release(manager_, frame, false);
+            return false;
+        }
+        if (subtree_min!=nullptr) {
+            *subtree_min=subtree_min_first;
+        }
+
+        for (std::size_t i=0;i<separator.count();i++) {
+            if (i>0) {
+                if (codec_.compare(separator.separator_key(i-1),separator.separator_key(i))>0){
+                    walk.findings.push_back("separators of block"+std::to_string(block)+"are out of order at position"+std::to_string(i));
+                }
+            }
+
+            std::uint32_t block_child=separator.child(i);
+            std::optional<std::string> subtree_min_local;
+            if (!verify_rec(block_child,depth, false,walk,error,&subtree_min_local)) {
+                release(manager_,frame,false);
+                return false;
+            }
+
+
+            if (!subtree_min_local.has_value()) {
+                walk.findings.push_back("block"+std::to_string(block)+"subtree don't has a value");
+            }else
+            //if (subtree_min_local!=separator.separator_key(i)) {
+            if (codec_.compare(subtree_min_local->data(),separator.separator_key(i))!=0){
+                walk.findings.push_back("block"+std::to_string(block)+"subtree don't is equal to her parent");
+                }
+            }
+        release(manager_,frame, false);
+        }
+
+    // Case for leafs
+    else{
+        BptLeafPage leaf;
+        size_t frame=0;
+        if (!pin_leaf(block,leaf,frame,error)){
+            return false;
+        }
+
+        //Regla de ocupancy
+        if (!is_root && (leaf.count()<min_leaf_entries() ||
+                       leaf.count()>max_leaf_entries() ) ) {
+            walk.findings.push_back("block"+std::to_string(block)+"has a bad entry count");
+                       }
+        if (subtree_min!=nullptr) {
+            if (leaf.count()==0) {
+                *subtree_min = std::nullopt;
+            }else if (subtree_min!=nullptr) {
+                *subtree_min=leaf.get_entry(0).key;
+            }
+        }
+
+
+        for (std::size_t i=0;i<leaf.count();i++) {
+            if (i>0) {
+                //if (codec_.compare(leaf.get_entry(i-1),leaf.separator_key(i))>0){
+                if (codec_.compare(leaf.get_entry(i-1).key.data(), leaf.get_entry(i).key.data()) > 0)  {
+                    walk.findings.push_back("leaves of block"+std::to_string(block)+"are out of order at position"+std::to_string(i));
+                }
+            }
+
+            if (!walk.occupied(leaf.get_entry(i).rid)){
+                walk.findings.push_back( "has a dangling rid at entry "+std::to_string(block));
+            }
+        }
+        if (walk.min_depth==0) {
+            walk.min_depth=depth;
+            walk.max_depth=depth;
+        }else {
+            if (depth<walk.min_depth) {
+                walk.min_depth=depth;
+            }
+            if (depth>walk.max_depth) {
+                walk.max_depth=depth;
+            }
+        }
+        walk.walked+=leaf.count();
+        release(manager_,frame, false);
+    }
+
+
+    /*
     (void)block;
     (void)depth;
     (void)is_root;
     (void)walk;
     (void)error;
     (void)subtree_min;
-    return false;
+    */
+    return true;
 }
 
 }
